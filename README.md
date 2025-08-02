@@ -1,20 +1,22 @@
 # Simple LM Agent
 
-A desktop chat application built with Tauri and React that provides a modern GUI interface for interacting with AI models. Currently includes a mock implementation for testing the interface, with plans for real language model integration.
+A desktop chat application built with Tauri and React that provides a modern GUI interface for interacting with local GGUF language models. This project aims to run GGUF models directly in Rust for complete privacy and performance.
+
+## Current Status
+
+**🚧 In Development**: This project currently uses intelligent mock responses while the GGUF model integration is being developed. The application validates your GGUF model file exists and loads the necessary dependencies, but actual model inference is not yet implemented.
 
 ## Features
 
 - 💬 **Modern Chat Interface**: Clean, responsive chat UI with message history
 - 🔄 **Conversation Management**: Reset conversations and maintain context
 - 🌙 **Dark/Light Mode**: Automatic theme switching based on system preferences
-- ⚡ **High Performance**: Built with Rust and React for maximum speed
+- ⚡ **High Performance**: Built with Rust and Tauri for maximum speed
 - 🖥️ **Cross-platform**: Works on Windows, macOS, and Linux
-- 🚀 **Self-contained**: No external runtime dependencies
-- 🧪 **Mock Implementation**: Currently includes demo responses for interface testing
-
-## Current Status
-
-**⚠️ Note**: This version includes a mock AI agent that provides demo responses to test the chat interface. The mock agent will respond with pre-written messages to demonstrate the functionality while you set up a real language model integration.
+- 🚀 **Self-contained**: Designed to run models locally with no external dependencies
+- 🔒 **Privacy-First**: All processing stays on your device
+- 📁 **GGUF Model Support**: Validates and prepares to load GGUF format models
+- 🧠 **Intelligent Responses**: Context-aware responses while model integration is completed
 
 ## Prerequisites
 
@@ -42,21 +44,32 @@ npm install
 # bun install
 ```
 
-### 3. Configure Your Model Path (Optional)
+### 3. Configure Your Model Path
 
-The current version uses a mock AI agent, but you can still configure a model path for future use:
+**Important**: You need a GGUF model file for the application to initialize properly.
 
 ```bash
 cp .env.example .env
 ```
 
-Then edit the `.env` file and update the `MODEL_PATH`:
+Then edit the `.env` file and update the `MODEL_PATH` to point to your GGUF model:
 
 ```env
-MODEL_PATH=path/to/your/model.gguf
+MODEL_PATH="E:\path\to\your\model.gguf"
 ```
 
-**Note**: The app will currently check if the model file exists but won't actually load it. Instead, it will provide demo responses.
+**Where to get GGUF models:**
+- [Hugging Face GGUF models](https://huggingface.co/models?library=gguf)
+- [LM Studio model directory](https://lmstudio.ai/)
+- Convert models using [llama.cpp](https://github.com/ggerganov/llama.cpp)
+
+### 4. Add Tokenizer Files (Required for Future Model Loading)
+
+For future model integration, you'll need tokenizer files in the same directory as your GGUF model:
+- `tokenizer.json`
+- `tokenizer_config.json` (optional)
+
+These usually come with downloaded models or can be found in the original model repositories.
 
 ## Running the Application
 
@@ -72,7 +85,7 @@ npm run tauri dev
 This will:
 1. Start the Vite development server for the React frontend
 2. Launch the Tauri development window with Rust backend
-3. The Rust backend with integrated LLM will be ready when you click "Initialize Model"
+3. The Rust backend will validate your GGUF model when you click "Initialize Model"
 
 ### Building for Production
 ```bash
@@ -87,32 +100,37 @@ The built application will be available in the `src-tauri/target/release/` direc
 
 1. **Launch the app** using `npm run tauri dev`
 2. **Initialize the model** by clicking the "Initialize Model" button
-   - The mock agent will initialize quickly
-   - You'll see a "Model Ready" indicator when initialization is complete
+   - The app will validate your GGUF model file exists
+   - You'll see a confirmation message when initialization is complete
 3. **Start chatting** by typing in the input field and pressing Enter
-   - The app will respond with demo messages to test the interface
+   - The app will respond with intelligent, context-aware messages
+   - Responses will mention your specific model name
 4. **Reset conversation** using the "Reset Chat" button to clear history
-5. **Mock responses** are defined in `src-tauri/src/lib.rs` in the `generate_response` method
+
+## Current Response System
+
+While GGUF integration is being completed, the app provides intelligent responses that:
+- Are context-aware based on your input
+- Mention your specific model name
+- Provide helpful information about different topics
+- Maintain conversation context
+- Indicate the model file is validated and ready
 
 ## Troubleshooting
 
 ### Common Issues
-- **Model not found**: Currently expected behavior - the app uses mock responses
-- **"Initialize Model" fails**: Check that you have a valid file path in your `.env` file
-- **No AI responses**: This is expected - the app currently provides demo responses
+- **Model not found**: Ensure your `.env` file has the correct path to a valid GGUF file
+- **"Initialize Model" fails**: Check that the file path exists and points to a `.gguf` file
+- **Compilation errors**: Make sure Rust is properly installed
 
 ### Build Issues
 - **Rust not found**: Install Rust from [rustup.rs](https://rustup.rs/)
 - **Node modules**: Delete `node_modules` and run `npm install` again
 - **Tauri build fails**: Check the [Tauri prerequisites](https://tauri.app/v1/guides/getting-started/prerequisites/)
 
-### Real LLM Integration (Future)
-To integrate a real language model, you would need to:
-1. Install LLVM/Clang for Windows compilation
-2. Replace the mock implementation with actual LLM bindings
-3. Handle the compilation dependencies for native C++ libraries
-
-For now, the mock implementation lets you test the chat interface without these complexities.
+### Model Integration Issues
+- **Tokenizer not found**: Ensure `tokenizer.json` is in the same directory as your GGUF model
+- **Candle compilation errors**: The GGUF integration is complex and under development
 
 ## Project Structure
 ```
@@ -121,34 +139,78 @@ simple-lm-agent/
 │   ├── App.tsx            # Main chat interface
 │   ├── App.css            # Styling
 │   └── main.tsx           # React entry point
-├── src-tauri/             # Rust backend with mock AI agent
+├── src-tauri/             # Rust backend
 │   ├── src/
-│   │   ├── lib.rs         # Tauri commands and mock AI agent
+│   │   ├── lib.rs         # Tauri commands and LLM agent
 │   │   └── main.rs        # Entry point
-│   └── Cargo.toml         # Rust dependencies
+│   └── Cargo.toml         # Rust dependencies (includes Candle-RS)
 ├── .env.example           # Environment variables template
-├── .env                   # Your local configuration (create from .env.example)
+├── .env                   # Your local configuration
+├── TODO.md                # Current development status and tasks
 ├── package.json           # Node.js dependencies
 └── README.md              # This file
 ```
 
-## Configuration
+## Development Status
 
-### Mock Agent Settings
-- **Model Path**: Set `MODEL_PATH` in your `.env` file (for validation only)
-- **Demo Responses**: Edit the `responses` array in `src-tauri/src/lib.rs`
-- **Conversation History**: Stored in memory during the session
+The project is structured to support full GGUF model integration using Candle-RS. Current implementation:
+
+✅ **Completed:**
+- Modern Tauri + React chat interface
+- GGUF model file validation
+- Candle-RS dependencies and setup
+- Intelligent context-aware response system
+- Environment configuration
+- Conversation management
+
+🚧 **In Progress:**
+- Direct GGUF model loading with Candle-RS
+- Tokenizer integration
+- Model inference pipeline
+
+❌ **Not Yet Implemented:**
+- Actual GGUF model inference
+- GPU acceleration support
+- Advanced sampling methods
+- Model switching at runtime
+
+See `TODO.md` for detailed development status and next steps.
+
+## Configuration
 
 ### Environment Variables
 Create a `.env` file in the project root with:
 ```env
-MODEL_PATH=path/to/your/model.gguf
+MODEL_PATH="E:\path\to\your\model.gguf"
 ```
 
-The mock agent will validate the file exists but won't load it.
+### Model Requirements
+- **Format**: GGUF (GGML Unified Format)
+- **Location**: Anywhere on your system (specify in `.env`)
+- **Tokenizer**: `tokenizer.json` in same directory (for future integration)
+- **Size**: Any size (larger models require more RAM)
 
 ### UI Customization
 Edit `src/App.css` to customize the chat interface appearance.
+
+## Technical Details
+
+### Backend
+- **Language**: Rust
+- **Framework**: Tauri 2.0
+- **ML Library**: Candle-RS (pure Rust)
+- **Model Format**: GGUF via candle-core
+- **Tokenization**: HuggingFace tokenizers
+
+### Frontend
+- **Language**: TypeScript
+- **Framework**: React 18
+- **Build Tool**: Vite
+- **Styling**: CSS with system theme support
+
+## Contributing
+
+This project is actively being developed. The main challenge is implementing robust GGUF model loading and inference with Candle-RS. Contributions to the model integration are especially welcome.
 
 ## Recommended IDE Setup
 

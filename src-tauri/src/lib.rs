@@ -5,6 +5,12 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 use tokio::sync::Mutex;
 use anyhow::{Result, anyhow};
+use candle_core::{Device, Tensor, DType};
+use candle_transformers::models::llama::{Llama, Config as LlamaConfig, Cache};
+use candle_nn::VarBuilder;
+use candle_core::quantized::gguf_file;
+use tokenizers::Tokenizer;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 struct ChatMessage {
@@ -12,37 +18,17 @@ struct ChatMessage {
     content: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct OpenAIMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Debug, Serialize)]
-struct OpenAIRequest {
-    model: String,
-    messages: Vec<OpenAIMessage>,
-    temperature: f32,
-    max_tokens: i32,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAIResponse {
-    choices: Vec<OpenAIChoice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAIChoice {
-    message: OpenAIMessage,
-}
-
 struct LLMAgent {
     model_path: Option<String>,
     conversation: Vec<ChatMessage>,
     system_prompt: String,
     is_initialized: bool,
-    server_url: String,
     model_name: String,
+    model: Option<Llama>,
+    tokenizer: Option<Tokenizer>,
+    device: Device,
+    cache: Option<Cache>,
+    config: Option<LlamaConfig>,
 }
 
 impl LLMAgent {
@@ -52,8 +38,12 @@ impl LLMAgent {
             conversation: Vec::new(),
             system_prompt: "You are a helpful assistant.".to_string(),
             is_initialized: false,
-            server_url: "http://localhost:1234".to_string(), // LM Studio default
             model_name: "local-model".to_string(),
+            model: None,
+            tokenizer: None,
+            device: Device::Cpu,
+            cache: None,
+            config: None,
         }
     }
 
@@ -71,7 +61,68 @@ impl LLMAgent {
             .and_then(|name| name.to_str())
             .unwrap_or("Unknown");
         self.model_name = model_name.to_string();
+
+        // Load GGUF model
+        println!("Loading GGUF model from: {}", model_path);
+        let mut file = std::fs::File::open(model_path)?;
+        let content = gguf_file::Content::read(&mut file)?;
         
+        // Extract model weights
+        let mut tensors: HashMap<String, Tensor> = HashMap::new();
+        for (name, tensor) in content.tensor_infos.iter() {
+            let tensor_data = content.tensor_data(name)?;
+            let shape: Vec<usize> = tensor.shape.iter().map(|&x| x as usize).collect();
+            let tensor = match tensor.ggml_dtype {
+                candle_core::quantized::GgmlDType::F32 => {
+                    let data: &[f32] = bytemuck::cast_slice(&tensor_data);
+                    Tensor::from_slice(data, &shape, &self.device)?
+                }
+                candle_core::quantized::GgmlDType::F16 => {
+                    let data: &[half::f16] = bytemuck::cast_slice(&tensor_data);
+                    let data: Vec<f32> = data.iter().map(|x| x.to_f32()).collect();
+                    Tensor::from_slice(&data, &shape, &self.device)?
+                }
+                _ => {
+                    return Err(anyhow!("Unsupported tensor dtype: {:?}", tensor.ggml_dtype));
+                }
+            };
+            tensors.insert(name.clone(), tensor);
+        }
+
+        // Create VarBuilder from tensors
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &self.device);
+
+        // Create config from GGUF metadata
+        let metadata = &content.metadata;
+        let config = LlamaConfig {
+            hidden_size: metadata.get("llama.embedding_length").and_then(|v| v.to_u32()).unwrap_or(4096) as usize,
+            intermediate_size: metadata.get("llama.feed_forward_length").and_then(|v| v.to_u32()).unwrap_or(11008) as usize,
+            vocab_size: metadata.get("llama.vocab_size").and_then(|v| v.to_u32()).unwrap_or(32000) as usize,
+            num_hidden_layers: metadata.get("llama.block_count").and_then(|v| v.to_u32()).unwrap_or(32) as usize,
+            num_attention_heads: metadata.get("llama.attention.head_count").and_then(|v| v.to_u32()).unwrap_or(32) as usize,
+            num_key_value_heads: metadata.get("llama.attention.head_count_kv").and_then(|v| v.to_u32()).unwrap_or(32) as usize,
+            rms_norm_eps: metadata.get("llama.attention.layer_norm_rms_epsilon").and_then(|v| v.to_f32()).unwrap_or(1e-6),
+            rope_theta: metadata.get("llama.rope.freq_base").and_then(|v| v.to_f32()).unwrap_or(10000.0),
+            max_position_embeddings: metadata.get("llama.context_length").and_then(|v| v.to_u32()).unwrap_or(2048) as usize,
+            use_flash_attn: false,
+        };
+
+        // Load the model
+        println!("Creating Llama model with config: {:?}", config);
+        let model = Llama::load(&vb, &config)?;
+        self.model = Some(model);
+        self.config = Some(config.clone());
+
+        // Initialize cache
+        self.cache = Some(Cache::new(true, DType::F32, &config, &self.device)?);
+
+        // Try to load tokenizer
+        self.tokenizer = self.load_tokenizer().await.ok();
+        
+        if self.tokenizer.is_none() {
+            return Err(anyhow!("Could not load tokenizer. Please ensure tokenizer.json is in the same directory as your model file."));
+        }
+
         // Initialize conversation with system prompt
         self.conversation.clear();
         self.conversation.push(ChatMessage {
@@ -79,33 +130,29 @@ impl LLMAgent {
             content: self.system_prompt.clone(),
         });
 
-        // Test connection to local LLM server
-        match self.test_server_connection().await {
-            Ok(_) => {
-                self.is_initialized = true;
-                Ok(format!("Connected to local LLM server! Using model: {}", model_name))
-            }
-            Err(_e) => {
-                // Fallback to mock mode if server not available
-                self.is_initialized = true;
-                Ok(format!("Model file validated: {} (Server not running - using mock responses. Start LM Studio or Ollama to use real LLM)", model_name))
-            }
-        }
+        self.is_initialized = true;
+        Ok(format!("Successfully loaded GGUF model: {} with real inference capability!", model_name))
     }
 
-    async fn test_server_connection(&self) -> Result<()> {
-        let client = reqwest::Client::new();
-        let response = client
-            .get(&format!("{}/v1/models", self.server_url))
-            .timeout(std::time::Duration::from_secs(3))
-            .send()
-            .await?;
-        
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(anyhow!("Server not responding"))
+    async fn load_tokenizer(&self) -> Result<Tokenizer> {
+        if let Some(model_path) = &self.model_path {
+            let model_dir = Path::new(model_path).parent().unwrap_or(Path::new("."));
+            
+            let tokenizer_paths = [
+                model_dir.join("tokenizer.json"),
+                model_dir.join("tokenizer_config.json"),
+                Path::new("tokenizer.json").to_path_buf(),
+            ];
+            
+            for path in &tokenizer_paths {
+                if path.exists() {
+                    println!("Loading tokenizer from: {:?}", path);
+                    return Tokenizer::from_file(path).map_err(|e| anyhow!("Tokenizer error: {}", e));
+                }
+            }
         }
+        
+        Err(anyhow!("Tokenizer file not found"))
     }
 
     async fn send_message(&mut self, message: &str) -> Result<String> {
@@ -119,90 +166,91 @@ impl LLMAgent {
             content: message.to_string(),
         });
 
-        // Try to use real LLM first, fallback to mock if server unavailable
-        match self.call_llm_server().await {
-            Ok(response) => {
-                // Add assistant response to conversation
-                self.conversation.push(ChatMessage {
-                    role: "assistant".to_string(),
-                    content: response.clone(),
-                });
-                Ok(response)
-            }
-            Err(_) => {
-                // Fallback to mock response
-                let response = self.generate_contextual_response(message);
-                self.conversation.push(ChatMessage {
-                    role: "assistant".to_string(),
-                    content: response.clone(),
-                });
-                Ok(response)
-            }
-        }
+        // Generate response using the actual model
+        let response = self.generate_response_with_model(message).await?;
+        
+        // Add assistant response to conversation
+        self.conversation.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: response.clone(),
+        });
+        
+        Ok(response)
     }
 
-    async fn call_llm_server(&self) -> Result<String> {
-        let client = reqwest::Client::new();
-        
-        // Convert conversation to OpenAI format
-        let messages: Vec<OpenAIMessage> = self.conversation
-            .iter()
-            .map(|msg| OpenAIMessage {
-                role: msg.role.clone(),
-                content: msg.content.clone(),
-            })
-            .collect();
+    async fn generate_response_with_model(&mut self, _message: &str) -> Result<String> {
+        let model = self.model.as_ref().ok_or_else(|| anyhow!("Model not loaded"))?;
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| anyhow!("Tokenizer not loaded"))?;
+        let cache = self.cache.as_mut().ok_or_else(|| anyhow!("Cache not initialized"))?;
 
-        let request = OpenAIRequest {
-            model: self.model_name.clone(),
-            messages,
-            temperature: 0.7,
-            max_tokens: 512,
-        };
-
-        let response = client
-            .post(&format!("{}/v1/chat/completions", self.server_url))
-            .json(&request)
-            .timeout(std::time::Duration::from_secs(30))
-            .send()
-            .await?;
-
-        if response.status().is_success() {
-            let llm_response: OpenAIResponse = response.json().await?;
-            if let Some(choice) = llm_response.choices.first() {
-                Ok(choice.message.content.clone())
-            } else {
-                Err(anyhow!("No response from LLM"))
+        // Build conversation context
+        let mut prompt = String::new();
+        for msg in &self.conversation {
+            match msg.role.as_str() {
+                "system" => prompt.push_str(&format!("System: {}\n", msg.content)),
+                "user" => prompt.push_str(&format!("User: {}\n", msg.content)),
+                "assistant" => prompt.push_str(&format!("Assistant: {}\n", msg.content)),
+                _ => {}
             }
-        } else {
-            Err(anyhow!("LLM server error: {}", response.status()))
         }
-    }
+        prompt.push_str("Assistant: ");
 
-    fn generate_contextual_response(&self, user_message: &str) -> String {
-        let user_lower = user_message.to_lowercase();
+        println!("Generating response for prompt: {}", prompt);
+
+        // Tokenize the prompt
+        let encoding = tokenizer.encode(prompt, false).map_err(|e| anyhow!("Tokenization failed: {}", e))?;
+        let tokens = encoding.get_ids();
+        println!("Tokenized to {} tokens", tokens.len());
         
-        // Get model name for context
-        let model_name = self.model_path.as_ref()
-            .and_then(|path| Path::new(path).file_name())
-            .and_then(|name| name.to_str())
-            .unwrap_or("your model");
+        let input_tokens = Tensor::new(tokens, &self.device)?.unsqueeze(0)?;
 
-        // Generate contextually appropriate responses
-        if user_lower.contains("hello") || user_lower.contains("hi") {
-            format!("Hello! I'm a Rust-based agent that will eventually run {} directly. How can I help you today?", model_name)
-        } else if user_lower.contains("model") || user_lower.contains("llm") {
-            format!("I'm currently in development mode, but I'm configured to use your {} model. Full LLM integration is coming soon!", model_name)
-        } else if user_lower.contains("rust") {
-            "Yes, I'm built entirely in Rust! This provides excellent performance and memory safety for running large language models.".to_string()
-        } else if user_lower.contains("performance") || user_lower.contains("speed") {
-            "Rust provides excellent performance for AI workloads. Once the LLM integration is complete, you'll see very fast inference times!".to_string()
-        } else if user_lower.contains("help") || user_lower.contains("what") {
-            "I'm a local AI assistant built with Rust and Tauri. I can chat with you and will soon be able to run your local language model directly for truly private AI conversations.".to_string()
-        } else {
-            format!("I understand you're asking about '{}'. I'm currently in development mode using your {} model. The full LLM integration will allow me to provide more sophisticated responses soon!", 
-                   user_message, model_name)
+        // Generate response tokens
+        let mut generated_tokens = Vec::new();
+        let mut current_tokens = input_tokens;
+        let max_new_tokens = 256;
+
+        for i in 0..max_new_tokens {
+            println!("Generation step {}", i);
+            
+            // Forward pass through model
+            let logits = model.forward(&current_tokens, 0, cache)?;
+            
+            // Get logits for the last token
+            let last_token_logits = logits.i((0, logits.dim(1)? - 1))?;
+            
+            // Simple greedy sampling - pick the token with highest probability
+            let next_token_id = last_token_logits.argmax(0)?.to_scalar::<u32>()?;
+            
+            // Check for end of sequence (common EOS tokens)
+            if next_token_id == 2 || next_token_id == 0 {
+                println!("Hit EOS token: {}", next_token_id);
+                break;
+            }
+            
+            generated_tokens.push(next_token_id);
+            
+            // Prepare next iteration - append the new token
+            let new_token = Tensor::new(&[next_token_id], &self.device)?.unsqueeze(0)?;
+            current_tokens = Tensor::cat(&[&current_tokens, &new_token], 1)?;
+            
+            // Stop if we've generated a reasonable amount
+            if generated_tokens.len() > 50 && generated_tokens.len() % 10 == 0 {
+                // Try to decode periodically to see if we have a complete thought
+                if let Ok(partial) = tokenizer.decode(&generated_tokens, true) {
+                    if partial.trim().ends_with('.') || partial.trim().ends_with('!') || partial.trim().ends_with('?') {
+                        break;
+                    }
+                }
+            }
         }
+
+        println!("Generated {} tokens", generated_tokens.len());
+
+        // Decode the generated tokens
+        let response = tokenizer.decode(&generated_tokens, true).map_err(|e| anyhow!("Decoding failed: {}", e))?;
+        
+        println!("Generated response: {}", response);
+        Ok(response.trim().to_string())
     }
 
     fn reset_conversation(&mut self) -> Result<()> {
@@ -211,6 +259,12 @@ impl LLMAgent {
             role: "system".to_string(),
             content: self.system_prompt.clone(),
         });
+        
+        // Reset cache
+        if let Some(config) = &self.config {
+            self.cache = Some(Cache::new(true, DType::F32, config, &self.device)?);
+        }
+        
         Ok(())
     }
 }
@@ -250,7 +304,7 @@ async fn send_message(message: String, state: State<'_, AppState>) -> Result<Str
     let agent_arc = state.llm_agent.clone();
     
     let result = {
-        let mut agent = agent_arc.lock().unwrap();
+        let mut agent = agent_arc.lock().await;
         agent.send_message(&message).await
     };
     
@@ -262,7 +316,7 @@ async fn send_message(message: String, state: State<'_, AppState>) -> Result<Str
 
 #[tauri::command]
 async fn reset_conversation(state: State<'_, AppState>) -> Result<String, String> {
-    let mut agent = state.llm_agent.lock().unwrap();
+    let mut agent = state.llm_agent.lock().await;
     
     match agent.reset_conversation() {
         Ok(_) => Ok("Conversation reset".to_string()),

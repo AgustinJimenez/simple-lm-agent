@@ -1,7 +1,13 @@
 {
   "permissions": {
     "allow": [
-      "Bash(rm:*)"
+      "Bash(rm:*)",
+      "Bash(cargo check:*)",
+      "Bash(copy .env.example .env)",
+      "Bash(cp:*)",
+      "Bash(cargo run:*)",
+      "Bash(npm run tauri:*)",
+      "Bash(cargo clean:*)"
     ],
     "deny": []
   }
