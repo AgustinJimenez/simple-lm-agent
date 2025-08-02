@@ -4,17 +4,20 @@
   "version": "0.1.0",
   "identifier": "com.simple-lm-agent.app",
   "build": {
-    "beforeDevCommand": "bun run dev",
+    "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "bun run build",
+    "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
   },
   "app": {
     "windows": [
       {
-        "title": "simple-lm-agent",
-        "width": 800,
-        "height": 600
+        "label": "main",
+        "title": "Simple LM Agent",
+        "width": 1000,
+        "height": 700,
+        "resizable": true,
+        "center": true
       }
     ],
     "security": {
