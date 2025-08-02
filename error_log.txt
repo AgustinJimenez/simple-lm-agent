@@ -1,67 +1,10 @@
-error: future cannot be sent between threads safely
-   --> src\lib.rs:221:1
-    |
-221 |   #[tauri::command]
-    |   ^^^^^^^^^^^^^^^^^ future returned by `initialize_model` is not `Send`
-...
-289 |           .invoke_handler(tauri::generate_handler![
-    |  _________________________-
-290 | |             initialize_model,
-291 | |             send_message,
-292 | |             reset_conversation,
-293 | |             update_system_prompt
-294 | |         ])
-    | |_________- in this macro invocation
-    |
-    = help: within `impl Future<Output = Result<std::string::String, std::string::String>>`, the trait `Send` is not implemented for `MutexGuard<'_, LLMAgent>`
-note: future is not `Send` as this value is used across an await
-   --> src\lib.rs:239:39
-    |
-238 |         let mut agent = agent_arc.lock().unwrap();
-    |             --------- has type `MutexGuard<'_, LLMAgent>` which is not `Send`
-239 |         agent.initialize(&model_path).await
-    |                                       ^^^^^ await occurs here, with `mut agent` maybe used later
-note: required by a bound in `ResultFutureTag::future`
-   --> C:\Users\agus_\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tauri-2.7.0\src\ipc\command.rs:314:42       
-    |
-310 |     pub async fn future<T, E, F>(self, value: F) -> Result<InvokeResponseBody, InvokeError>
-    |                  ------ required by a bound in this associated function
-...
-314 |       F: Future<Output = Result<T, E>> + Send,
-    |                                          ^^^^ required by this bound in `ResultFutureTag::future`
-    = note: this error originates in the macro `__cmd__initialize_model` which comes from the expansion of the macro `tauri::generate_handler` (in Nightly builds, run with -Z macro-backtrace for more info)
-
-error: future cannot be sent between threads safely
-   --> src\lib.rs:248:1
-    |
-248 |   #[tauri::command]
-    |   ^^^^^^^^^^^^^^^^^ future returned by `send_message` is not `Send`
-...
-289 |           .invoke_handler(tauri::generate_handler![
-    |  _________________________-
-290 | |             initialize_model,
-291 | |             send_message,
-292 | |             reset_conversation,
-293 | |             update_system_prompt
-294 | |         ])
-    | |_________- in this macro invocation
-    |
-    = help: within `impl Future<Output = Result<std::string::String, std::string::String>>`, the trait `Send` is not implemented for `MutexGuard<'_, LLMAgent>`
-note: future is not `Send` as this value is used across an await
-   --> src\lib.rs:255:38
-    |
-254 |         let mut agent = agent_arc.lock().unwrap();
-    |             --------- has type `MutexGuard<'_, LLMAgent>` which is not `Send`
-255 |         agent.send_message(&message).await
-    |                                      ^^^^^ await occurs here, with `mut agent` maybe used later
-note: required by a bound in `ResultFutureTag::future`
-   --> C:\Users\agus_\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tauri-2.7.0\src\ipc\command.rs:314:42       
-    |
-310 |     pub async fn future<T, E, F>(self, value: F) -> Result<InvokeResponseBody, InvokeError>
-    |                  ------ required by a bound in this associated function
-...
-314 |       F: Future<Output = Result<T, E>> + Send,
-    |                                          ^^^^ required by this bound in `ResultFutureTag::future`
-    = note: this error originates in the macro `__cmd__send_message` which comes from the expansion of the macro `tauri::generate_handler` (in Nightly builds, run with -Z macro-backtrace for more info)
-
-error: could not compile `simple-lm-agent` (lib) due to 4 previous errors
+Error: Failed to initialize model: 
+The test.rs example uses APIs that don't exist in candle 0.8: 
+- Config::from_gguf() doesn't exist 
+- gguf.var_builder() doesn't exist 
+- model.empty_cache() doesn't exist 
+- SafeTensors::load() is private The test.rs appears to be written for a different candle version. 
+To implement real inference, we need to: 
+1. Find the correct candle version for test.rs, OR 
+2. Research candle 0.8 APIs and rewrite the model loading Your model file is validated and ready 
+- we just need compatible APIs.

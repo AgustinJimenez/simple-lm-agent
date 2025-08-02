@@ -1,16 +1,17 @@
 use std::sync::Arc;
 use std::env;
 use std::path::Path;
-use serde::{Deserialize, Serialize};
 use tauri::State;
 use tokio::sync::Mutex;
 use anyhow::{Result, anyhow};
-use candle_core::{Device, Tensor, DType};
-use candle_transformers::models::llama::{Llama, Config as LlamaConfig, Cache};
-use candle_nn::VarBuilder;
-use candle_core::quantized::gguf_file;
-use tokenizers::Tokenizer;
-use std::collections::HashMap;
+use llama_cpp_2::{
+    llama_backend::LlamaBackend,
+    model::{LlamaModel, params::LlamaModelParams, AddBos, Special},
+    context::params::LlamaContextParams,
+    sampling::LlamaSampler,
+    llama_batch::LlamaBatch,
+};
+use std::num::NonZeroU32;
 
 #[derive(Debug, Clone)]
 struct ChatMessage {
@@ -18,17 +19,15 @@ struct ChatMessage {
     content: String,
 }
 
+
 struct LLMAgent {
     model_path: Option<String>,
     conversation: Vec<ChatMessage>,
     system_prompt: String,
     is_initialized: bool,
     model_name: String,
-    model: Option<Llama>,
-    tokenizer: Option<Tokenizer>,
-    device: Device,
-    cache: Option<Cache>,
-    config: Option<LlamaConfig>,
+    // Remove the direct storage of llama components due to Send/Sync issues
+    // We'll create them when needed in each method
 }
 
 impl LLMAgent {
@@ -39,11 +38,6 @@ impl LLMAgent {
             system_prompt: "You are a helpful assistant.".to_string(),
             is_initialized: false,
             model_name: "local-model".to_string(),
-            model: None,
-            tokenizer: None,
-            device: Device::Cpu,
-            cache: None,
-            config: None,
         }
     }
 
@@ -62,66 +56,28 @@ impl LLMAgent {
             .unwrap_or("Unknown");
         self.model_name = model_name.to_string();
 
-        // Load GGUF model
+        // Test that we can initialize the components (but don't store them)
+        println!("Initializing llama-cpp backend...");
+        let _backend = LlamaBackend::init().map_err(|e| anyhow!("Failed to initialize llama backend: {:?}", e))?;
+
         println!("Loading GGUF model from: {}", model_path);
-        let mut file = std::fs::File::open(model_path)?;
-        let content = gguf_file::Content::read(&mut file)?;
+        let model_params = LlamaModelParams::default();
+        let _model = LlamaModel::load_from_file(
+            &_backend,
+            model_path,
+            &model_params
+        ).map_err(|e| anyhow!("Failed to load model: {:?}", e))?;
         
-        // Extract model weights
-        let mut tensors: HashMap<String, Tensor> = HashMap::new();
-        for (name, tensor) in content.tensor_infos.iter() {
-            let tensor_data = content.tensor_data(name)?;
-            let shape: Vec<usize> = tensor.shape.iter().map(|&x| x as usize).collect();
-            let tensor = match tensor.ggml_dtype {
-                candle_core::quantized::GgmlDType::F32 => {
-                    let data: &[f32] = bytemuck::cast_slice(&tensor_data);
-                    Tensor::from_slice(data, &shape, &self.device)?
-                }
-                candle_core::quantized::GgmlDType::F16 => {
-                    let data: &[half::f16] = bytemuck::cast_slice(&tensor_data);
-                    let data: Vec<f32> = data.iter().map(|x| x.to_f32()).collect();
-                    Tensor::from_slice(&data, &shape, &self.device)?
-                }
-                _ => {
-                    return Err(anyhow!("Unsupported tensor dtype: {:?}", tensor.ggml_dtype));
-                }
-            };
-            tensors.insert(name.clone(), tensor);
-        }
-
-        // Create VarBuilder from tensors
-        let vb = VarBuilder::from_tensors(tensors, DType::F32, &self.device);
-
-        // Create config from GGUF metadata
-        let metadata = &content.metadata;
-        let config = LlamaConfig {
-            hidden_size: metadata.get("llama.embedding_length").and_then(|v| v.to_u32()).unwrap_or(4096) as usize,
-            intermediate_size: metadata.get("llama.feed_forward_length").and_then(|v| v.to_u32()).unwrap_or(11008) as usize,
-            vocab_size: metadata.get("llama.vocab_size").and_then(|v| v.to_u32()).unwrap_or(32000) as usize,
-            num_hidden_layers: metadata.get("llama.block_count").and_then(|v| v.to_u32()).unwrap_or(32) as usize,
-            num_attention_heads: metadata.get("llama.attention.head_count").and_then(|v| v.to_u32()).unwrap_or(32) as usize,
-            num_key_value_heads: metadata.get("llama.attention.head_count_kv").and_then(|v| v.to_u32()).unwrap_or(32) as usize,
-            rms_norm_eps: metadata.get("llama.attention.layer_norm_rms_epsilon").and_then(|v| v.to_f32()).unwrap_or(1e-6),
-            rope_theta: metadata.get("llama.rope.freq_base").and_then(|v| v.to_f32()).unwrap_or(10000.0),
-            max_position_embeddings: metadata.get("llama.context_length").and_then(|v| v.to_u32()).unwrap_or(2048) as usize,
-            use_flash_attn: false,
-        };
-
-        // Load the model
-        println!("Creating Llama model with config: {:?}", config);
-        let model = Llama::load(&vb, &config)?;
-        self.model = Some(model);
-        self.config = Some(config.clone());
-
-        // Initialize cache
-        self.cache = Some(Cache::new(true, DType::F32, &config, &self.device)?);
-
-        // Try to load tokenizer
-        self.tokenizer = self.load_tokenizer().await.ok();
+        println!("Testing context creation...");
+        let context_params = LlamaContextParams::default()
+            .with_n_ctx(Some(NonZeroU32::new(2048).unwrap()))  // Set context size
+            .with_n_batch(512)                             // Set batch size
+            .with_n_threads(8);                 // Set number of threads
         
-        if self.tokenizer.is_none() {
-            return Err(anyhow!("Could not load tokenizer. Please ensure tokenizer.json is in the same directory as your model file."));
-        }
+        let _context = _model.new_context(
+            &_backend,
+            context_params
+        ).map_err(|e| anyhow!("Failed to create context: {:?}", e))?;
 
         // Initialize conversation with system prompt
         self.conversation.clear();
@@ -131,29 +87,9 @@ impl LLMAgent {
         });
 
         self.is_initialized = true;
-        Ok(format!("Successfully loaded GGUF model: {} with real inference capability!", model_name))
+        Ok(format!("Successfully loaded GGUF model: {} with llama-cpp-rs real inference capability!", model_name))
     }
 
-    async fn load_tokenizer(&self) -> Result<Tokenizer> {
-        if let Some(model_path) = &self.model_path {
-            let model_dir = Path::new(model_path).parent().unwrap_or(Path::new("."));
-            
-            let tokenizer_paths = [
-                model_dir.join("tokenizer.json"),
-                model_dir.join("tokenizer_config.json"),
-                Path::new("tokenizer.json").to_path_buf(),
-            ];
-            
-            for path in &tokenizer_paths {
-                if path.exists() {
-                    println!("Loading tokenizer from: {:?}", path);
-                    return Tokenizer::from_file(path).map_err(|e| anyhow!("Tokenizer error: {}", e));
-                }
-            }
-        }
-        
-        Err(anyhow!("Tokenizer file not found"))
-    }
 
     async fn send_message(&mut self, message: &str) -> Result<String> {
         if !self.is_initialized {
@@ -179,11 +115,32 @@ impl LLMAgent {
     }
 
     async fn generate_response_with_model(&mut self, _message: &str) -> Result<String> {
-        let model = self.model.as_ref().ok_or_else(|| anyhow!("Model not loaded"))?;
-        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| anyhow!("Tokenizer not loaded"))?;
-        let cache = self.cache.as_mut().ok_or_else(|| anyhow!("Cache not initialized"))?;
+        let model_path = self.model_path.as_ref().ok_or_else(|| anyhow!("Model path not set"))?;
 
-        // Build conversation context
+        // Create fresh llama components for this generation
+        println!("Creating llama backend...");
+        let backend = LlamaBackend::init().map_err(|e| anyhow!("Failed to initialize llama backend: {:?}", e))?;
+
+        println!("Loading model...");
+        let model_params = LlamaModelParams::default();
+        let model = LlamaModel::load_from_file(
+            &backend,
+            model_path,
+            &model_params
+        ).map_err(|e| anyhow!("Failed to load model: {:?}", e))?;
+        
+        println!("Creating context...");
+        let context_params = LlamaContextParams::default()
+            .with_n_ctx(Some(NonZeroU32::new(2048).unwrap()))
+            .with_n_batch(512)
+            .with_n_threads(8);
+        
+        let mut context = model.new_context(
+            &backend,
+            context_params
+        ).map_err(|e| anyhow!("Failed to create context: {:?}", e))?;
+
+        // Build conversation context as prompt
         let mut prompt = String::new();
         for msg in &self.conversation {
             match msg.role.as_str() {
@@ -197,59 +154,57 @@ impl LLMAgent {
 
         println!("Generating response for prompt: {}", prompt);
 
-        // Tokenize the prompt
-        let encoding = tokenizer.encode(prompt, false).map_err(|e| anyhow!("Tokenization failed: {}", e))?;
-        let tokens = encoding.get_ids();
-        println!("Tokenized to {} tokens", tokens.len());
+        // Tokenize the prompt using the model
+        let tokens = model.str_to_token(&prompt, AddBos::Always)
+            .map_err(|e| anyhow!("Tokenization failed: {:?}", e))?;
         
-        let input_tokens = Tensor::new(tokens, &self.device)?.unsqueeze(0)?;
+        println!("Tokenized to {} tokens", tokens.len());
 
-        // Generate response tokens
-        let mut generated_tokens = Vec::new();
-        let mut current_tokens = input_tokens;
-        let max_new_tokens = 256;
+        // Clear context and encode prompt
+        context.clear_kv_cache();
+        let mut batch = LlamaBatch::new(tokens.len(), 1);
+        for (i, token) in tokens.iter().enumerate() {
+            batch.add(*token, i as i32, &[0], false)?;
+        }
+        context.decode(&mut batch)
+            .map_err(|e| anyhow!("Failed to decode prompt: {:?}", e))?;
 
-        for i in 0..max_new_tokens {
-            println!("Generation step {}", i);
+        // Create sampler for token generation
+        let mut sampler = LlamaSampler::chain_simple([
+            LlamaSampler::temp(0.8),
+            LlamaSampler::top_k(40),
+            LlamaSampler::top_p(0.9, 1),  // min_keep = 1
+        ]);
+
+        // Generate tokens
+        let mut response_tokens = Vec::new();
+        let max_tokens = 128;
+        
+        for i in 0..max_tokens {
+            let next_token = sampler.sample(&context, (tokens.len() + i) as i32);
             
-            // Forward pass through model
-            let logits = model.forward(&current_tokens, 0, cache)?;
-            
-            // Get logits for the last token
-            let last_token_logits = logits.i((0, logits.dim(1)? - 1))?;
-            
-            // Simple greedy sampling - pick the token with highest probability
-            let next_token_id = last_token_logits.argmax(0)?.to_scalar::<u32>()?;
-            
-            // Check for end of sequence (common EOS tokens)
-            if next_token_id == 2 || next_token_id == 0 {
-                println!("Hit EOS token: {}", next_token_id);
+            // Check for end of sequence
+            if next_token == model.token_eos() {
+                println!("Hit EOS token after {} tokens", i);
                 break;
             }
             
-            generated_tokens.push(next_token_id);
+            response_tokens.push(next_token);
             
-            // Prepare next iteration - append the new token
-            let new_token = Tensor::new(&[next_token_id], &self.device)?.unsqueeze(0)?;
-            current_tokens = Tensor::cat(&[&current_tokens, &new_token], 1)?;
-            
-            // Stop if we've generated a reasonable amount
-            if generated_tokens.len() > 50 && generated_tokens.len() % 10 == 0 {
-                // Try to decode periodically to see if we have a complete thought
-                if let Ok(partial) = tokenizer.decode(&generated_tokens, true) {
-                    if partial.trim().ends_with('.') || partial.trim().ends_with('!') || partial.trim().ends_with('?') {
-                        break;
-                    }
-                }
-            }
+            // Decode the new token
+            let mut single_batch = LlamaBatch::new(1, 1);
+            single_batch.add(next_token, (tokens.len() + i) as i32, &[0], false)?;
+            context.decode(&mut single_batch)
+                .map_err(|e| anyhow!("Failed to decode token: {:?}", e))?;
         }
 
-        println!("Generated {} tokens", generated_tokens.len());
+        println!("Generated {} tokens total", response_tokens.len());
 
-        // Decode the generated tokens
-        let response = tokenizer.decode(&generated_tokens, true).map_err(|e| anyhow!("Decoding failed: {}", e))?;
+        // Detokenize the response tokens using the model
+        let response = model.tokens_to_str(&response_tokens, Special::Tokenize)
+            .map_err(|e| anyhow!("Detokenization failed: {:?}", e))?;
         
-        println!("Generated response: {}", response);
+        println!("Generated Text:\n{}", response);
         Ok(response.trim().to_string())
     }
 
@@ -260,11 +215,7 @@ impl LLMAgent {
             content: self.system_prompt.clone(),
         });
         
-        // Reset cache
-        if let Some(config) = &self.config {
-            self.cache = Some(Cache::new(true, DType::F32, config, &self.device)?);
-        }
-        
+        // No need to clear KV cache since we create fresh contexts for each generation
         Ok(())
     }
 }
@@ -277,13 +228,13 @@ struct AppState {
 async fn initialize_model(state: State<'_, AppState>) -> Result<String, String> {
     // Load .env file if it exists
     if let Err(_) = dotenvy::dotenv() {
-        // .env file not found, that's okay
+        return Err("No .env file found. Please create a .env file with MODEL_PATH specified.".to_string());
     }
     
-    // Get model path from environment variable or use default
-    let model_path = env::var("MODEL_PATH").unwrap_or_else(|_| {
-        r"E:\.lmstudio\models\lmstudio-community\Qwen3-30B-A3B-Instruct-2507-GGUF\Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf".to_string()
-    });
+    // Get model path from environment variable - required, no default
+    let model_path = env::var("MODEL_PATH").map_err(|_| {
+        "MODEL_PATH not found in .env file. Please add MODEL_PATH=/path/to/your/model.gguf to your .env file.".to_string()
+    })?;
     
     // Clone the Arc to avoid holding the lock across await
     let agent_arc = state.llm_agent.clone();

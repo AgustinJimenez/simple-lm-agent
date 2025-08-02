@@ -7,7 +7,16 @@
       "Bash(cp:*)",
       "Bash(cargo run:*)",
       "Bash(npm run tauri:*)",
-      "Bash(cargo clean:*)"
+      "Bash(cargo clean:*)",
+      "Bash(npm install)",
+      "Bash(cargo build:*)",
+      "Bash(timeout 15s npm run tauri dev)",
+      "Bash(rustc:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:docs.rs)",
+      "Bash(brew install:*)",
+      "Bash(ls:*)",
+      "Bash(find:*)"
     ],
     "deny": []
   }
